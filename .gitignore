@@ -1,0 +1,7 @@
+*.pkl
+*.jsonl
+.env
+__pycache__/
+.venv/
+vault/
+storage/
