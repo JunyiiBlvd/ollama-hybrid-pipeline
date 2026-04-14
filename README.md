@@ -154,6 +154,30 @@ python pipeline_api.py
 # Models: local-pipeline, local-orchestrator
 ```
 
+## Interactive Shell
+
+`pshell.py` is a persistent REPL that connects to `pipeline_api.py` over the OpenAI-compatible
+endpoint. Start the API first, then:
+
+```bash
+python pshell.py
+```
+
+| Command | Description |
+|---|---|
+| `/help` | Show all commands |
+| `/clear` | Reset conversation context |
+| `/switch <port>` | Switch pipeline port, re-runs preflight |
+| `/log` | Last 5 entries from the active routing log |
+| `/memory` | 3 most recent session memory files by mtime |
+| `/models` | MODEL_MAP cross-referenced against live Ollama models |
+| `/exit`, `/quit` | Exit (saves session to vault if ≥3 turns) |
+
+Session prompts are written to `$PIPELINE_VAULT_PATH/AI/memory/` on clean exit if the session
+had at least 3 turns.
+
+---
+
 ## Skill Files
 
 Skill files live in `$PIPELINE_VAULT_PATH/AI/skills/`. Each file is loaded when the router
