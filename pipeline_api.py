@@ -1,5 +1,49 @@
 #!/usr/bin/env python3
-# pipeline_api.py — OpenAI-compatible HTTP wrapper for the local AI pipeline
+# pipeline_api.py — OpenAI-compatible HTTP wrapper for the pipeline pipeline
+# v10 — Wired call_ollama_safe() to backend.py adapter
+#
+# Changes from v9:
+# - Replaced direct Ollama POST in call_ollama_safe() with call_backend() from backend.py
+# - No interface changes — callers unaffected
+# - Known gap: _stream_pipeline() still calls Ollama directly (not wired in this pass)
+#
+# Changes from v8 (now v9):
+#   - SECURITY: uvicorn.run host changed 0.0.0.0 → 127.0.0.1. The 0.0.0.0
+#     binding was the FastAPI default, not a deliberate LAN-trust decision.
+#     With write_vault_file and orchestrator live, LAN exposure is no longer
+#     bounded. Open WebUI uses --network=host so it reaches 127.0.0.1:11436
+#     unchanged. No auth layer added — loopback is sufficient for single-user.
+#
+# Changes from v7:
+#   - log_interaction() gains eval_passed (bool|null), eval_score (int|null),
+#     and eval_failures (list[{type,severity,issue}]|null) parameters.
+#   - sync path: first-attempt log stores first-attempt eval; retried output
+#     is re-evaluated before final log so eval fields match actual output.
+#   - streaming path writes null eval fields (eval requires full response).
+#
+# v7 — Stop sequence for multi-turn fake user turns
+#
+# Changes from v6:
+#   - Ollama API calls now include stop=["User:", "\nUser:"] to prevent
+#     model from generating fake user turns in multi-turn sessions
+#
+# v6 — Footer sentinel collision fix
+#
+# Changes from v5:
+#   - Footer sentinel changed from "\n\n---\n" to "\n\n<<<PIPELINE_FOOTER>>>\n"
+#     — prevents collision with markdown horizontal rules in model output
+#
+# v5 — Resilient SSE error handling
+#
+# Changes from v4:
+#   - _stream_pipeline(): except Exception added after ConnectionError/Timeout catches;
+#     all unhandled exceptions now yield a clean SSE error chunk instead of crashing
+#     the generator and causing ChunkedEncodingError on the client
+#   - _stream_orchestrator(): stderr logging added to existing exception handlers;
+#     error chunk updated to include exception type
+#   - exception type, message, and model logged to stderr on stream failure in both
+#     streaming generators
+#
 # v4 — Orchestrator model + streaming log
 #
 # Changes from v3:
@@ -7,19 +51,28 @@
 #     model=local-orchestrator are routed to run_orchestrator() instead of
 #     the regular pipeline. For stream=True, yields an immediate status chunk
 #     then the full orchestrator output. For stream=False, runs synchronously
-#     and returns the final step output.
+#     and returns the final step output. Exposes agentic multi-step goal
+#     execution from Open WebUI — select local-orchestrator, send a goal.
 #   - Streaming path now logs to routing-log.jsonl. Previously all stream=True
 #     requests were invisible to the evaluator and routing accuracy system.
+#     Tokens are buffered in _stream_pipeline and logged after [DONE] with
+#     source="api-stream". Streaming requests now appear in log_view.py output.
 #
 # Changes from v2:
 #   - stream=True requests now return a StreamingResponse using SSE (Server-Sent
 #     Events) in OpenAI chunk format. Ollama is called with stream=True and each
-#     token chunk is forwarded immediately, giving Open WebUI live token output.
+#     token chunk is forwarded immediately, giving Open WebUI live token output
+#     instead of a frozen wait followed by a full response dump.
 #   - Streaming path skips evaluation and retry (eval requires the full response).
+#     Evaluation and retry remain active on the non-streaming path.
+#   - _stream_pipeline() added — runs routing/skill/context synchronously, then
+#     streams Ollama tokens. Appends routing metadata as the final chunk.
+#   - StreamingResponse imported from fastapi.responses.
 #
 # Changes from v1:
 #   - route() now returns a 4-tuple (selected_model, task_scores, model_scores,
-#     router_path) since router.py v3.3.
+#     router_path) since router.py v3.3. Fixed unpack at line ~241 that was
+#     only capturing 3 values (would crash on any API request).
 #   - router_path ("keyword", "llm", "default") added to log entries.
 #
 # Changes from v1 (original):
@@ -30,17 +83,20 @@
 #     instead of sys.exit() so the server stays alive on Ollama errors
 #   - Extracts last user message from OpenAI messages array
 #   - Multi-turn context: all prior messages passed as conversation history
-#   - Pipeline metadata injected as a comment in the response body
-#   - Runs on 0.0.0.0:PIPELINE_PORT — reachable from Open WebUI's --network host
+#     in the prompt (Ollama /api/generate has no native multi-turn support)
+#   - Pipeline metadata injected as a comment in the response body so
+#     Open WebUI users can see which skill/model was selected
+#   - Runs on 127.0.0.1:11436 — reachable from Open WebUI's --network host
 #
 # Usage:
 #   pip install fastapi uvicorn
+#   cd <repo>/
 #   python pipeline_api.py
 #
 # Open WebUI setup:
 #   Settings → Connections → OpenAI-Compatible APIs
-#   URL:     http://127.0.0.1:<PIPELINE_PORT>
-#   API Key: any non-empty string
+#   URL:     http://127.0.0.1:11436
+#   API Key: pipeline (any non-empty string)
 #   Model will appear as: local-pipeline
 
 import os
@@ -58,7 +114,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
-# Add pipeline directory to path so imports work regardless of cwd
+# Add router directory to path so pipeline imports work regardless of cwd
 ROUTER_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROUTER_DIR))
 
@@ -71,13 +127,14 @@ from constraints import load_constraints
 from context_loader import load_context
 from evaluator import evaluate
 from orchestrator import run_orchestrator
+from backend import call_backend, BackendConnectionError
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 
-app = FastAPI(title="local AI pipeline API", version="1.0.0")
+app = FastAPI(title="pipeline pipeline API", version="1.0.0")
 
-PORT                  = int(os.getenv("PIPELINE_PORT", "11436"))
-MODEL_ID              = "local-pipeline"
+PORT = int(os.getenv("PIPELINE_PORT", "11436"))
+MODEL_ID = "local-pipeline"
 ORCHESTRATOR_MODEL_ID = "local-orchestrator"
 
 
@@ -177,32 +234,27 @@ def build_multi_turn_prompt(messages: list[Message], final_prompt: str) -> str:
 
 def call_ollama_safe(model: str, prompt: str, system: str = "") -> str:
     """
-    Call Ollama API. Raises HTTPException instead of sys.exit() —
-    keeps the server alive on Ollama errors.
+    Call inference backend. Raises HTTPException instead of sys.exit() —
+    keeps the server alive on backend errors.
     """
-    payload = {
-        "model":   model,
-        "prompt":  prompt,
-        "stream":  False,
-        "options": {"temperature": 0.7},
-    }
-    if system:
-        payload["system"] = system
-
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=180)
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-
-    except requests.exceptions.ConnectionError:
+        return call_backend(
+            model,
+            prompt,
+            stream=False,
+            temperature=0.7,
+            system=system,
+            stop=["User:", "\nUser:"],
+        )
+    except BackendConnectionError as e:
+        if isinstance(e.original, requests.exceptions.Timeout):
+            raise HTTPException(
+                status_code=504,
+                detail="Ollama timed out after 180 seconds."
+            )
         raise HTTPException(
             status_code=503,
             detail="Cannot connect to Ollama. Run: sudo systemctl start ollama"
-        )
-    except requests.exceptions.Timeout:
-        raise HTTPException(
-            status_code=504,
-            detail="Ollama timed out after 180 seconds."
         )
     except requests.exceptions.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Ollama API error: {e}")
@@ -219,6 +271,9 @@ def log_interaction(
     retried: bool = False,
     source: str = "api",
     router_path: str = "default",
+    eval_passed: bool | None = None,
+    eval_score: int | None = None,
+    eval_failures: list | None = None,
 ):
     """Write one JSONL entry to routing-log.jsonl. source='api' distinguishes
     web UI requests from CLI runs."""
@@ -240,6 +295,9 @@ def log_interaction(
         "notes":              "",
         "retried":            retried,
         "source":             source,
+        "eval_passed":        eval_passed,
+        "eval_score":         eval_score,
+        "eval_failures":      eval_failures,
     }
 
     with open(LOG_FILE, "a") as f:
@@ -294,6 +352,9 @@ def run_pipeline(messages: list[Message]) -> tuple[str, dict]:
                 retried=False,
                 source="api",
                 router_path=router_path,
+                eval_passed=eval_result.passed,
+                eval_score=round(eval_result.score * 100),
+                eval_failures=[{"type": f.type, "severity": f.severity, "issue": f.issue} for f in eval_result.failures],
             )
             # Build retry prompt
             issues_text = "\n".join(f"- {issue}" for issue in critical_issues)
@@ -304,6 +365,7 @@ def run_pipeline(messages: list[Message]) -> tuple[str, dict]:
             )
             output = call_ollama_safe(selected_model, retry_prompt, system=system_context)
             retried = True
+            eval_result = evaluate(output, skill_loaded)
 
     # Log final output
     log_interaction(
@@ -317,6 +379,9 @@ def run_pipeline(messages: list[Message]) -> tuple[str, dict]:
         retried=retried,
         source="api",
         router_path=router_path,
+        eval_passed=eval_result.passed,
+        eval_score=round(eval_result.score * 100),
+        eval_failures=[{"type": f.type, "severity": f.severity, "issue": f.issue} for f in eval_result.failures],
     )
 
     metadata = {
@@ -379,6 +444,7 @@ def _stream_pipeline(messages: list[Message]):
         "model":   selected_model,
         "prompt":  prompt_to_send,
         "stream":  True,
+        "stop":    ["User:", "\nUser:"],
         "options": {"temperature": 0.7},
     }
     if system_context:
@@ -411,8 +477,13 @@ def _stream_pipeline(messages: list[Message]):
         yield _make_chunk("\n\n[ERROR] Ollama timed out.")
         yield "data: [DONE]\n\n"
         return
+    except Exception as e:
+        print(f"[stream error] {type(e).__name__}: {e} | model: {selected_model}", file=sys.stderr)
+        yield _make_chunk(f"\n\n[ERROR] Stream failed: {type(e).__name__}")
+        yield "data: [DONE]\n\n"
+        return
 
-    # Log the completed streaming interaction
+    # Log the completed streaming interaction — previously a data blackhole
     log_interaction(
         prompt=prompt,
         selected_model=selected_model,
@@ -424,15 +495,18 @@ def _stream_pipeline(messages: list[Message]):
         retried=False,
         source="api-stream",
         router_path=router_path,
+        eval_passed=None,
+        eval_score=None,
+        eval_failures=None,
     )
 
     # Append routing metadata as final chunk
     meta = (
-        f"\n\n---\n"
+        f"\n\n<<<PIPELINE_FOOTER>>>\n"
         f"*routed → {selected_model} | skill: {skill_loaded} | path: {router_path}*"
     )
     if clarifications:
-        meta += "\n*disambiguation injected*"
+        meta += "\n*ℹ disambiguation injected*"
     yield _make_chunk(meta)
 
     # Done
@@ -478,16 +552,18 @@ def _stream_orchestrator(messages: list[Message]):
         }
         return f"data: {json.dumps(payload)}\n\n"
 
-    yield _make_chunk("*[orchestrator] Decomposing goal into steps...*\n\n")
+    yield _make_chunk("*[orchestrator] Decomposing goal into steps…*\n\n")
 
     try:
         output = run_orchestrator(goal, write_memory=True)
     except SystemExit:
+        print(f"[stream error] SystemExit | model: {ORCHESTRATOR_MODEL_ID}", file=sys.stderr)
         yield _make_chunk("\n\n[ERROR] Orchestrator failed — check Ollama connectivity.")
         yield "data: [DONE]\n\n"
         return
     except Exception as e:
-        yield _make_chunk(f"\n\n[ERROR] Orchestrator error: {e}")
+        print(f"[stream error] {type(e).__name__}: {e} | model: {ORCHESTRATOR_MODEL_ID}", file=sys.stderr)
+        yield _make_chunk(f"\n\n[ERROR] Orchestrator error: {type(e).__name__}")
         yield "data: [DONE]\n\n"
         return
 
@@ -512,13 +588,13 @@ def list_models():
                 "id":       MODEL_ID,
                 "object":   "model",
                 "created":  ts,
-                "owned_by": "local-pipeline",
+                "owned_by": "pipeline",
             },
             {
                 "id":       ORCHESTRATOR_MODEL_ID,
                 "object":   "model",
                 "created":  ts,
-                "owned_by": "local-pipeline",
+                "owned_by": "pipeline",
             },
         ],
     }
@@ -585,9 +661,9 @@ def chat_completions(request: ChatCompletionRequest):
         f"*routed → {metadata['model']} | skill: {metadata['skill_loaded']}*",
     ]
     if metadata["retried"]:
-        meta_lines.append("*retry fired (evaluator caught critical failure)*")
+        meta_lines.append("*⚠ retry fired (evaluator caught critical failure)*")
     if metadata["disambiguated"]:
-        meta_lines.append("*disambiguation injected*")
+        meta_lines.append("*ℹ disambiguation injected*")
     if metadata["task_scores"]:
         scores_str = ", ".join(f"{k}:{v}" for k, v in metadata["task_scores"].items())
         meta_lines.append(f"*task signals: {scores_str}*")
@@ -630,4 +706,4 @@ if __name__ == "__main__":
     print(f"[pipeline_api] models: {MODEL_ID}, {ORCHESTRATOR_MODEL_ID}")
     print(f"[pipeline_api] health: http://127.0.0.1:{PORT}/health")
     print(f"[pipeline_api] Open WebUI connection URL: http://127.0.0.1:{PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")

@@ -31,8 +31,10 @@
 # Step types in a plan:
 #   pipeline  — routes through the full local AI stack (route → skill → context
 #                → constraints → Ollama → evaluate). Output feeds next step.
-#   tool      — calls a registered tool from tools.py (read/write vault file).
-#                Tool output is injected into the next pipeline step.
+#   tool      — calls a registered tool from tools.py (read_vault_file,
+#                write_vault_file). Tool output is injected into the next
+#                pipeline step. web_search was removed in tools.py v4 — there
+#                is no outbound-network tool on this path.
 #
 # CLI usage:
 #   python orchestrator.py "Research QLoRA fine-tuning and write a summary"

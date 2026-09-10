@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-# context_loader.py — Dynamic ground-truth context injector for local AI pipeline
-# v4 — Manifest cap + CONTEXT_INJECT_LIMIT increase
+# context_loader.py — Dynamic ground-truth context injector for pipeline pipeline
+# v5 — Priority Zero compliance: remove subprocess pip install
+#
+# Changes from v4:
+#   - SECURITY (Priority Zero rule #1): Removed subprocess.check_call pip install
+#     of rank_bm25 that fired on first import when the package was missing. That
+#     was an external network call on the pipeline path without explicit approval.
+#     rank_bm25 must now be installed manually before running the pipeline
+#     (see requirements.txt and README.md). The _BM25_AVAILABLE = False fallback
+#     path is unchanged — cosine-only mode continues to work without rank_bm25.
 #
 # Changes from v3:
 #   - get_file_manifest() output capped at 200 chars: shows first 10 files then
@@ -15,21 +23,24 @@
 #     search_knowledge_base() and load_recent_memory(). Both paths run on every
 #     query; results are merged and deduplicated by (source_file, chunk_text).
 #   - BM25 indexes .md files at paragraph level (double-newline split), not file
-#     level. Finer granularity gives BM25 better TF signal.
-#   - Tokenizer preserves hyphenated tokens intact: technical model names,
-#     version strings like "v3.3", tool names. Splits on whitespace and
-#     punctuation except hyphens. Exact-match queries that cosine misses
-#     consistently hit on BM25.
+#     level. Finer granularity gives BM25 better TF signal — a paragraph containing
+#     "nomic-embed-text" twice scores higher than a 1500-char file where the term
+#     appears once. Cosine remains file-level (unchanged).
+#   - Tokenizer preserves hyphenated tokens intact: "nomic-embed-text",
+#     "mxbai-embed-large", version strings like "v3.3", tool names. Splits on
+#     whitespace and punctuation except hyphens. Technical exact-match queries
+#     that cosine misses consistently hit on BM25.
 #   - BM25 index is NOT persisted to disk — rebuilt from source .md files at module
 #     import time in milliseconds. No new pkl files. No disk writes for BM25.
-#   - rank_bm25 is installed automatically on first import if not present. If install
-#     fails, BM25 is disabled and the module falls back to cosine-only silently.
-#     Never crashes context_loader regardless of rank_bm25 availability.
+#   - rank_bm25 must be installed manually (pip install rank_bm25 or via
+#     requirements.txt). If not installed, BM25 is disabled and the module falls
+#     back to cosine-only silently. Never crashes context_loader regardless of
+#     rank_bm25 availability.
 #   - Why BM25 was added: cosine similarity on nomic-embed-text embeddings fails for
 #     low-frequency technical tokens — model names, version strings, tool names. These
 #     tokens are rare in the embedding model's training distribution so their vectors
 #     carry weak specific meaning. BM25 is exact token frequency matching — it finds
-#     a term in a document because the string is literally there. The two
+#     "nomic-embed-text" in a document because the string is literally there. The two
 #     methods are complementary: cosine for conceptual relevance, BM25 for exact terms.
 #
 # Changes from v1:
@@ -37,12 +48,12 @@
 #     instead of keyword scoring. Threshold: similarity > 0.25.
 #   - load_recent_memory() now uses rag_index.query_memory() (relevance-ranked)
 #     instead of most-recently-modified-file ordering.
-#   - Keyword helper functions removed.
+#   - Keyword helper functions (_STOPWORDS, _prompt_words, _keyword_score) removed.
 #   - Added import of rag_index module.
 #
 # WHAT THIS IS:
 #   Skills teach the model how to behave.
-#   context_loader tells the model what is real — what files exist,
+#   context-loader tells the model what is real — what files exist,
 #   what has been built, what the knowledge base contains, what happened recently.
 #
 # WHAT THIS IS NOT:
@@ -52,6 +63,11 @@
 #   Called from load_skill() in run_task.py.
 #   Output is injected AFTER skill content, BEFORE hard constraints.
 #   Constraint order is preserved — nothing from this file can override constraints.
+#
+# PATHS:
+#   Router dir:    <repo>/
+#   Knowledge dir: <vault>/AI/knowledge/
+#   Memory dir:    <vault>/AI/memory/
 #
 # LIMIT:
 #   CONTEXT_INJECT_LIMIT is defined in config.py — do not reuse SKILL_INJECT_LIMIT
@@ -71,23 +87,13 @@ MEMORY_DIR    = VAULT / "AI/memory"
 
 # ─── BM25 Support ─────────────────────────────────────────────────────────────
 
-# rank_bm25 is optional — install on first import if missing, degrade silently
-# on failure. _BM25_AVAILABLE controls whether BM25 paths are attempted.
+# rank_bm25 is optional — install manually via requirements.txt before running.
+# _BM25_AVAILABLE controls whether BM25 paths are attempted.
 try:
     from rank_bm25 import BM25Okapi as _BM25Okapi
     _BM25_AVAILABLE = True
 except ImportError:
-    try:
-        import subprocess, sys as _sys
-        subprocess.check_call(
-            [_sys.executable, "-m", "pip", "install", "rank_bm25", "-q"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        from rank_bm25 import BM25Okapi as _BM25Okapi
-        _BM25_AVAILABLE = True
-    except Exception:
-        _BM25_AVAILABLE = False
+    _BM25_AVAILABLE = False
 
 
 def _tokenize(text: str) -> list[str]:
@@ -95,7 +101,7 @@ def _tokenize(text: str) -> list[str]:
     Tokenize text for BM25, preserving hyphenated technical tokens intact.
 
     Splits on whitespace and common punctuation but NOT hyphens. This ensures
-    hyphenated model names and version strings remain single tokens and match
+    "nomic-embed-text" and "mxbai-embed-large" remain single tokens and match
     documents that contain exactly those strings.
 
     Lowercases all tokens. Filters empty strings.
@@ -197,7 +203,7 @@ def _merge(
 
 def get_file_manifest() -> str:
     """
-    List all files in the pipeline directory with sizes.
+    List all files in the router directory with sizes.
     Gives the model awareness of what scripts exist — prevents hallucinating
     filenames or claiming files don't exist.
 
@@ -216,7 +222,7 @@ def get_file_manifest() -> str:
         lines.append(f"  {f.name} ({size_kb:.1f}KB)")
 
     _MAX_MANIFEST_CHARS = 200
-    header = "## Pipeline Directory — Current Files\n"
+    header = "## Router Directory — Current Files\n"
     output = header
     shown = 0
     for line in lines:
@@ -236,7 +242,7 @@ def get_file_manifest() -> str:
 
 def inject_referenced_files(prompt: str) -> str:
     """
-    If the prompt names a file that exists in the pipeline directory, inject
+    If the prompt names a file that exists in the router directory, inject
     its content so the model can see exactly what's in it.
 
     Matching logic:
@@ -288,7 +294,7 @@ def search_knowledge_base(prompt: str) -> str:
     via nomic-embed-text. Only includes results above _KB_SIMILARITY_THRESHOLD.
 
     BM25 path: paragraph-level index rebuilt at import time. Exact token matching
-    — finds model names, version strings, tool names that cosine misses.
+    — finds "nomic-embed-text", version strings, tool names that cosine misses.
     No threshold — any positive BM25 score is included.
 
     Results are merged and deduplicated by (stem, chunk_text[:100]). Cosine
@@ -364,7 +370,7 @@ def load_context(prompt: str, task: str = "") -> str:
       [base context] → [skill content] → [THIS BLOCK] → [hard constraints]
 
     Assembles four sections in order:
-      1. File manifest    — what pipeline scripts exist on disk
+      1. File manifest    — what router scripts exist on disk
       2. Referenced file  — content of a file named in the prompt (if any)
       3. Knowledge chunk  — hybrid cosine+BM25 search over knowledge base
       4. Recent memory    — hybrid cosine+BM25 search over session memory

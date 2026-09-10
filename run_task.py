@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
-# run_task.py — CLI entry point for the local AI pipeline
-# v5 — --close-thread flag
+# run_task.py — CLI entry point for the pipeline AI pipeline
+# v7 — Wired call_ollama() and call_ollama_chat() to backend.py adapter
+#
+# Changes from v6:
+# - Replaced direct Ollama POST in call_ollama() with call_backend()
+# - Replaced /api/chat call in call_ollama_chat() with call_backend() + prompt flattening
+#   (mirrors build_multi_turn_prompt() logic from pipeline_api.py)
+# - No interface changes — callers unaffected
+#
+# Changes from v5 (now v6):
+#   - log_interaction() gains eval_passed (bool|null), eval_score (int|null),
+#     and eval_failures (list[{type,severity,issue}]|null) parameters.
+#   - First-attempt log on retry path stores first-attempt eval outcome.
+#   - Retried output is re-evaluated before final log so eval fields always
+#     match the output actually written to the log.
+#   - Override path (--model flag) writes null eval fields.
 #
 # Changes from v4:
 #   - --close-thread THREAD_ID flag added: calls close_thread() from
@@ -11,7 +25,7 @@
 #
 # Changes from v3:
 #   - route() now returns a 4-tuple; unpacked as (selected_model, task_scores,
-#     model_scores, router_path) at the call site
+#     model_scores, router_path) at the call site (~line 276)
 #   - router_path passed to log_interaction() and written to log entry as
 #     "router_path" field ("keyword", "llm", or "default")
 #   - --show-system flag added: prints the fully assembled system prompt to
@@ -24,7 +38,9 @@
 #   - retry fires once on critical failure: logs first attempt (retried=false),
 #     prepends specific failure reasons to prompt, calls Ollama a second time
 #   - print(output) moved to after evaluate/retry block — only final output ever
-#     printed.
+#     printed. Previously output was printed before evaluation, meaning both the
+#     failed first attempt and retry output appeared in stdout, causing false
+#     failures in test_suite when evaluating concatenated output
 #   - retried boolean field added to log entry
 #
 # Changes from v1:
@@ -44,11 +60,10 @@
 # Usage:
 #   python run_task.py "your prompt here"
 #   python run_task.py "your prompt here" --debug
-#   python run_task.py "your prompt here" --model qwen2.5:14b
+#   python run_task.py "your prompt here" --model the primary model
 #   python run_task.py "your prompt here" --no-log
 #   python run_task.py --list-models
 
-import os
 import sys
 import json
 import argparse
@@ -57,9 +72,10 @@ from datetime import datetime
 from pathlib import Path
 from router import route, check_disambiguation
 from config import (
-    OLLAMA_URL, OLLAMA_CHAT_URL, SKILL_FILES, BASE_CONTEXT_FILE,
+    SKILL_FILES, BASE_CONTEXT_FILE,
     SKILL_INJECT_LIMIT, BASE_INJECT_LIMIT, LOG_FILE, TASK_PRIORITY
 )
+from backend import call_backend, BackendConnectionError
 from thread_store import (
     new_thread, load_thread, save_thread, append_exchange,
     get_thread_as_messages, print_threads, close_thread,
@@ -75,7 +91,7 @@ def load_skill(task_scores: dict, prompt: str = "") -> tuple[str, str]:
     Load the most relevant skill file as system context.
     Returns: (system_prompt, skill_name_loaded)
 
-    Always loads base context (base-context.md, truncated).
+    Always loads base context (pipeline-context.md, truncated).
     Then loads the dominant task skill on top.
     """
     system_parts = []
@@ -147,31 +163,17 @@ def build_prompt_with_disambiguation(prompt: str) -> str:
 # ─── Ollama API ───────────────────────────────────────────────────────────────
 
 def call_ollama(model: str, prompt: str, system: str = "") -> str:
-    """Send a single prompt to Ollama /api/generate and return response text."""
-    payload = {
-        "model":  model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.7},
-    }
-    if system:
-        payload["system"] = system
-
+    """Send a single prompt to the inference backend and return response text."""
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-
-    except requests.exceptions.ConnectionError:
-        print("\n[ERROR] Cannot connect to Ollama.")
-        print("  → Try: sudo systemctl start ollama")
+        return call_backend(model, prompt, stream=False, temperature=0.7, system=system)
+    except BackendConnectionError as e:
+        if isinstance(e.original, requests.exceptions.Timeout):
+            print("\n[ERROR] Ollama timed out after 120 seconds.")
+            print("  → Model may still be loading. Wait 30s and retry.")
+        else:
+            print("\n[ERROR] Cannot connect to Ollama.")
+            print("  → Try: sudo systemctl start ollama")
         sys.exit(1)
-
-    except requests.exceptions.Timeout:
-        print("\n[ERROR] Ollama timed out after 120 seconds.")
-        print("  → Model may still be loading. Wait 30s and retry.")
-        sys.exit(1)
-
     except requests.exceptions.HTTPError as e:
         print(f"\n[ERROR] Ollama API error: {e}")
         sys.exit(1)
@@ -179,40 +181,41 @@ def call_ollama(model: str, prompt: str, system: str = "") -> str:
 
 def call_ollama_chat(model: str, messages: list, system: str = "") -> str:
     """
-    Send a conversation history to Ollama /api/chat and return the response text.
-    Used when a thread is active — passes full message history so the model has
-    continuity across prompts.
+    Send a conversation history to the inference backend and return the response text.
+    Used when a thread is active — flattens message history to a single prompt string
+    (mirrors build_multi_turn_prompt() in pipeline_api.py).
 
-    system: injected as the first message with role="system" if provided.
-    messages: list of {"role": "user"|"assistant", "content": "..."} dicts.
+    system: injected as system context.
+    messages: list of {"role": "user"|"assistant", "content": "..."} dicts,
+              with the last entry being the current user message.
     """
-    full_messages = []
-    if system:
-        full_messages.append({"role": "system", "content": system})
-    full_messages.extend(messages)
-
-    payload = {
-        "model":    model,
-        "messages": full_messages,
-        "stream":   False,
-        "options":  {"temperature": 0.7},
-    }
+    if not messages:
+        flat_prompt = ""
+    elif len(messages) == 1:
+        flat_prompt = messages[0]["content"]
+    else:
+        history = messages[:-1]
+        current = messages[-1]["content"]
+        lines = []
+        for msg in history:
+            label = "User" if msg["role"] == "user" else "Assistant"
+            lines.append(f"{label}: {msg['content']}")
+        history_block = "\n".join(lines)
+        flat_prompt = (
+            f"[Conversation history]\n{history_block}\n\n"
+            f"[Current request]\n{current}"
+        )
 
     try:
-        response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        return response.json().get("message", {}).get("content", "").strip()
-
-    except requests.exceptions.ConnectionError:
-        print("\n[ERROR] Cannot connect to Ollama.")
-        print("  → Try: sudo systemctl start ollama")
+        return call_backend(model, flat_prompt, stream=False, temperature=0.7, system=system)
+    except BackendConnectionError as e:
+        if isinstance(e.original, requests.exceptions.Timeout):
+            print("\n[ERROR] Ollama timed out after 120 seconds.")
+            print("  → Model may still be loading. Wait 30s and retry.")
+        else:
+            print("\n[ERROR] Cannot connect to Ollama.")
+            print("  → Try: sudo systemctl start ollama")
         sys.exit(1)
-
-    except requests.exceptions.Timeout:
-        print("\n[ERROR] Ollama timed out after 120 seconds.")
-        print("  → Model may still be loading. Wait 30s and retry.")
-        sys.exit(1)
-
     except requests.exceptions.HTTPError as e:
         print(f"\n[ERROR] Ollama API error: {e}")
         sys.exit(1)
@@ -230,6 +233,9 @@ def log_interaction(
     disambiguated: bool,
     retried: bool = False,
     router_path: str = "default",
+    eval_passed: bool | None = None,
+    eval_score: int | None = None,
+    eval_failures: list | None = None,
 ):
     """
     Append one JSON line to the routing log file.
@@ -253,6 +259,9 @@ def log_interaction(
         "correct":       None,                 # fill in manually or via evaluator later
         "notes":         "",                   # fill in manually after review
         "retried":       retried,              # true if this entry is a retry attempt
+        "eval_passed":   eval_passed,
+        "eval_score":    eval_score,
+        "eval_failures": eval_failures,
     }
 
     with open(LOG_FILE, "a") as f:
@@ -296,7 +305,7 @@ def main():
     _ollama_base = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
     parser = argparse.ArgumentParser(
-        description="local AI pipeline"
+        description="pipeline AI pipeline"
     )
     parser.add_argument("prompt", nargs="?", help="Prompt to send")
     parser.add_argument("--model",       help="Override model selection")
@@ -418,6 +427,7 @@ def main():
 
     # Evaluate output — retry once on critical failure, skip on --model override
     retried = False
+    eval_result = None
     if not args.model:
         eval_result = evaluate(output, skill_loaded)
         if not eval_result.passed:
@@ -435,6 +445,9 @@ def main():
                         disambiguated  = disambiguated,
                         retried        = False,
                         router_path    = router_path,
+                        eval_passed    = eval_result.passed,
+                        eval_score     = round(eval_result.score * 100),
+                        eval_failures  = [{"type": f.type, "severity": f.severity, "issue": f.issue} for f in eval_result.failures],
                     )
                 # Build retry prompt with specific failure reasons
                 issues_text = "\n".join(f"- {issue}" for issue in critical_issues)
@@ -449,6 +462,7 @@ def main():
                 else:
                     output = call_ollama(selected_model, retry_prompt, system=system_context)
                 retried = True
+                eval_result = evaluate(output, skill_loaded)
 
     # Print final output only — one print, whether or not retry fired
     if retried:
@@ -476,6 +490,9 @@ def main():
             disambiguated  = disambiguated,
             retried        = retried,
             router_path    = router_path,
+            eval_passed    = eval_result.passed if eval_result else None,
+            eval_score     = round(eval_result.score * 100) if eval_result else None,
+            eval_failures  = [{"type": f.type, "severity": f.severity, "issue": f.issue} for f in eval_result.failures] if eval_result else None,
         )
 
 

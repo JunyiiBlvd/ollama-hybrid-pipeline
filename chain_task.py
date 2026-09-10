@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-# chain_task.py — 3-step chained pipeline runner for the local AI pipeline
-# v1
+# chain_task.py — 3-step chained pipeline runner for the pipeline AI pipeline
+# v2 — eval fields added to JSONL log entries
+#
+# Changes from v1:
+#   - log_chain_interaction() gains eval_passed (bool|null), eval_score
+#     (int|null), and eval_failures (list[{type,severity,issue}]|null).
+#   - run_step() passes eval outcome from evaluate() to log call.
 #
 # What this file does:
 #   Accepts a list of step prompts and runs them in sequence through the
@@ -56,6 +61,9 @@ def log_chain_interaction(
     router_path: str,
     chain_id: str,
     step_num: int,
+    eval_passed: bool | None = None,
+    eval_score: int | None = None,
+    eval_failures: list | None = None,
 ):
     """Append a JSONL log entry. Includes chain_id and chain_step fields."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +85,9 @@ def log_chain_interaction(
         "retried":           retried,
         "chain_id":          chain_id,
         "chain_step":        step_num,
+        "eval_passed":       eval_passed,
+        "eval_score":        eval_score,
+        "eval_failures":     eval_failures,
     }
 
     with open(LOG_FILE, "a") as f:
@@ -163,6 +174,9 @@ def run_step(
         router_path=router_path,
         chain_id=chain_id,
         step_num=step_num,
+        eval_passed=eval_result.passed,
+        eval_score=round(eval_result.score * 100),
+        eval_failures=[{"type": f.type, "severity": f.severity, "issue": f.issue} for f in eval_result.failures],
     )
 
     return output, eval_result.passed
@@ -171,7 +185,7 @@ def run_step(
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="local AI pipeline chained runner")
+    parser = argparse.ArgumentParser(description="pipeline chained pipeline runner")
     parser.add_argument(
         "--chain", nargs="+", required=True, metavar="STEP",
         help="Ordered list of step prompts to run in sequence"

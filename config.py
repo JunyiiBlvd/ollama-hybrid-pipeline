@@ -1,3 +1,10 @@
+# config.py
+# v2 — Added backend config: BACKEND, BACKEND_URLS, MODEL_ALIASES
+#
+# Changes from v1:
+# - Added BACKEND, BACKEND_URLS, MODEL_ALIASES for backend.py adapter
+# - No interface changes — existing OLLAMA_URL/OLLAMA_CHAT_URL unchanged
+
 import os
 from pathlib import Path
 
@@ -7,6 +14,35 @@ OLLAMA_CHAT_URL = _OLLAMA_BASE + "/api/chat"
 
 _PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "qwen2.5:14b")
 _FAST_MODEL    = os.getenv("FAST_MODEL", "llama3.2")
+
+# --- Backend ---
+# Options: "ollama" | "llamacpp" | "vllm"
+BACKEND = os.getenv("PIPELINE_BACKEND", "ollama")
+
+# Base URLs per backend (only the active backend is used at runtime)
+BACKEND_URLS = {
+    "ollama":   _OLLAMA_BASE,
+    "llamacpp": os.getenv("LLAMACPP_URL", "http://127.0.0.1:8080"),
+    "vllm":     os.getenv("VLLM_URL", "http://127.0.0.1:8000"),
+}
+
+# Model name translation table
+# Maps internal model names to backend-specific names.
+# Ollama uses Modelfile tags, llama.cpp uses file paths, vLLM uses HF identifiers.
+# Pass-through: if a name is absent from the active backend's dict, it is used unchanged.
+MODEL_ALIASES = {
+    "ollama": {
+        # Ollama native names match MODEL_MAP values — no translation needed
+    },
+    "llamacpp": {
+        _PRIMARY_MODEL: "qwen2.5-14b-q4_k_m.gguf",   # placeholder — update to actual filename
+        _FAST_MODEL:    "llama-3.2-3b-q4_k_m.gguf",  # placeholder — update to actual filename
+    },
+    "vllm": {
+        _PRIMARY_MODEL: "Qwen/Qwen2.5-14B-Instruct",         # placeholder — update to actual HF id
+        _FAST_MODEL:    "meta-llama/Llama-3.2-3B-Instruct",  # placeholder
+    },
+}
 
 # Vault base path — your knowledge, skills, and memory directory
 VAULT = Path(os.getenv("PIPELINE_VAULT_PATH", "./vault"))

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-# thread_store.py — Conversation thread persistence for the local AI pipeline
-# v2
+# thread_store.py — Conversation thread persistence for the pipeline pipeline
+# v3 — Wired close_thread() Ollama call to backend.py adapter
 #
-# Changes from v1:
+# Changes from v2:
+# - Replaced direct Ollama POST in close_thread() with call_backend() from backend.py
+# - No interface changes — callers unaffected
+#
+# Changes from v1 (now v2):
 #   - close_thread(thread_id) added — calls the primary model via /api/generate to
 #     summarize a thread (what was decided, built, and remains open), writes the
 #     summary to AI/memory/THREAD_ID-closed.md with YAML frontmatter, moves the
@@ -38,11 +42,11 @@
 
 import os
 import json
-import requests
 import rag_index
 from datetime import datetime
 from pathlib import Path
-from config import VAULT, OLLAMA_URL
+from config import VAULT
+from backend import call_backend, BackendConnectionError
 
 THREADS_DIR  = VAULT / "AI/memory/threads"
 MEMORY_DIR   = VAULT / "AI/memory"
@@ -219,19 +223,13 @@ def close_thread(thread_id: str) -> Path:
 
     prompt = _SUMMARIZE_PROMPT.format(conversation=conversation)
 
-    # Call Ollama
-    payload = {
-        "model":  _SUMMARIZE_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.3},
-    }
+    # Call backend
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        summary = response.json().get("response", "").strip()
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Ollama call failed during close_thread: {e}") from e
+        summary = call_backend(
+            _SUMMARIZE_MODEL, prompt, stream=False, temperature=0.3
+        )
+    except (BackendConnectionError, Exception) as e:
+        raise RuntimeError(f"Backend call failed during close_thread: {e}") from e
 
     if not summary:
         raise RuntimeError("Ollama returned an empty summary.")

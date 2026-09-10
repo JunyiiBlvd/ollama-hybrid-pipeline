@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
-# tools.py — Tool registry for the local AI pipeline orchestrator
-# v4
+# tools.py — Tool registry for the pipeline orchestrator
+# v5
+#
+# Changes from v4:
+#   - SECURITY (3.1): write_vault_file now caps content at _FILE_WRITE_CAP
+#     (50 000 bytes). Content above the cap is truncated and a
+#     "[truncated at 50000 bytes]" marker is appended. The return value
+#     includes a WARNING suffix when truncation fires. Previously the tool
+#     accepted whatever the model produced — a step whose prompt said "dump
+#     the full context" could write megabytes to the vault.
+#   - SECURITY (3.3): write_vault_file now enforces an allowlist on the
+#     resolved path. Only AI/memory/ and AI/notes/ are valid write targets.
+#     All other paths are rejected with a clear error. The check is on the
+#     resolved Path object (not the raw string) so AI/memory/../foo bypasses
+#     are not possible. Previously _safe_vault_path only blocked escape from
+#     the vault root — a model could overwrite Projects/pipeline-setup/
+#     router/tools.py or CLAUDE.md.
 #
 # Changes from v3:
 #   - web_search() removed entirely. DDG scraping was blocked by bot detection;
@@ -18,8 +33,10 @@
 #       Blocks any path that resolves outside VAULT. Caps at 4000 chars.
 #
 #   write_vault_file(relative_path, content)
-#     → Writes content to a file in VAULT. Creates parent dirs. Blocks path traversal.
-#       Returns the absolute path written.
+#     → Writes content to a file in VAULT under AI/memory/ or AI/notes/ only.
+#       Blocks path traversal and paths outside the allowlist. Caps at 50 000
+#       bytes. Returns the absolute path written, with a WARNING suffix if
+#       content was truncated.
 #
 # Tool registry:
 #   TOOL_REGISTRY — dict mapping tool name → callable
@@ -28,7 +45,16 @@
 from pathlib import Path
 from config import VAULT
 
-_FILE_READ_CAP = 4000
+_FILE_READ_CAP  = 4_000
+_FILE_WRITE_CAP = 50_000
+
+# Resolved allowlist for write_vault_file — checked against the resolved Path,
+# not the raw string, so AI/memory/../foo traversals are caught.
+_VAULT_RESOLVED = VAULT.resolve()
+_WRITE_ALLOWLIST = [
+    str(_VAULT_RESOLVED / "AI" / "memory") + "/",
+    str(_VAULT_RESOLVED / "AI" / "notes") + "/",
+]
 
 
 # ─── Vault File Tools ─────────────────────────────────────────────────────────
@@ -77,21 +103,42 @@ def read_vault_file(relative_path: str) -> str:
 
 def write_vault_file(relative_path: str, content: str) -> str:
     """
-    Write content to a file in VAULT. Creates parent directories.
+    Write content to a file in VAULT under AI/memory/ or AI/notes/ only.
     relative_path is relative to the vault root.
     Example: "AI/memory/orchestrator-output.md"
 
-    Returns the absolute path of the file written, or an error string.
+    Validation chain:
+      1. _safe_vault_path — rejects any path that resolves outside VAULT.
+      2. Allowlist check — rejects resolved paths outside AI/memory/ or AI/notes/.
+         Checked on the resolved Path so AI/memory/../foo traversals are caught.
+      3. Size cap — content above _FILE_WRITE_CAP (50 000 bytes) is truncated
+         and a marker is appended.
+
+    Returns the absolute path written (with a WARNING suffix if truncated),
+    or an error string on rejection.
     """
     result = _safe_vault_path(relative_path)
     if isinstance(result, str):
         return result
     path = result
 
+    # Allowlist: reject any resolved path outside AI/memory/ or AI/notes/
+    if not any(str(path).startswith(prefix) for prefix in _WRITE_ALLOWLIST):
+        allowed = " or ".join(f"AI/{p.split('/AI/')[1].rstrip('/')}" for p in _WRITE_ALLOWLIST)
+        return (
+            f"[write_vault_file] ERROR: writes restricted to {allowed}: {relative_path!r}"
+        )
+
+    # Size cap: truncate and mark rather than silently writing huge files
+    warning = ""
+    if len(content) > _FILE_WRITE_CAP:
+        content = content[:_FILE_WRITE_CAP] + "\n[truncated at 50000 bytes]"
+        warning = f" [WARNING: content exceeded {_FILE_WRITE_CAP} bytes and was truncated]"
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return str(path)
+        return str(path) + warning
     except Exception as e:
         return f"[write_vault_file] ERROR writing {relative_path!r}: {e}"
 
